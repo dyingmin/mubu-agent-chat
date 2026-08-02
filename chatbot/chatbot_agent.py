@@ -62,8 +62,8 @@ class ChatBot:
     1. 加载历史消息
     2. 检查上下文压缩
     3. 构建 messages 列表
-    4. 调用 LLM 决定是否使用知识库工具
-    5. 如果触发工具，则直接返回工具结果
+    4. 调用 LLM 决定是否使用工具
+    5. 如果触发工具，执行工具后把结果交给 LLM 生成最终回答
     6. 保存 user / assistant 到历史
     7. 返回最终回复
     """
@@ -220,8 +220,7 @@ class ChatBot:
                 tool_choice="auto" if self._tools else "none",
             )
 
-            # 方案 A：工具直接返回最终答案。
-            # 如果 LLM 触发了工具调用，就直接执行工具并把结果作为最终回复。
+            # 两段式：工具检索 + LLM 基于检索结果生成回答
             if response.has_tool_calls and self._tool_executor:
                 tool_results = await self._tool_executor.execute_parallel(
                     response.tool_calls or [],
@@ -230,9 +229,17 @@ class ChatBot:
                 self._last_tool_results = [item.to_dict() for item in tool_results]
                 self._last_source = "knowledge_base"
 
-                final_content = "\n\n".join(
-                    item.content.strip() for item in tool_results if item.content.strip()
-                ).strip()
+                # 把工具结果交给 LLM，生成有条理的最终回答
+                final_messages = self._message_builder.build_final_answer_messages(
+                    query=query,
+                    tool_results=self._last_tool_results,
+                    history=history,
+                )
+                final_response = await self._llm_client.chat(
+                    final_messages,
+                    tool_choice="none",
+                )
+                final_content = (final_response.content or "").strip()
                 if not final_content:
                     final_content = "知识库暂时没有返回可用答案。"
             else:
