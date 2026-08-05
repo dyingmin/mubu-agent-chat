@@ -8,15 +8,25 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import List, Sequence
 
+
 import chromadb
 import numpy as np
 import requests
 from rank_bm25 import BM25Okapi
+from http import HTTPStatus
+
+try:
+    import dashscope  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover - optional dependency
+    dashscope = None
 from config import (
     AppPaths,
     BM25_WEIGHT,
     CHUNK_MAX_CHARS,
     CHUNK_OVERLAP_CHARS,
+    DOCX_ENABLE_SEMANTIC_CHUNKING,
+    EMBEDDING_API_KEY,
+    EMBEDDING_MODEL,
     HYBRID_TOP_K,
     MIN_CONTEXT_SCORE,
     QWEN_API_KEY,
@@ -24,6 +34,10 @@ from config import (
     QWEN_MODEL,
     QWEN_TIMEOUT,
     RERANK_TOP_K,
+    SEMANTIC_CHUNK_BREAKPOINT_PERCENTILE,
+    SEMANTIC_CHUNK_BUFFER_SIZE,
+    SEMANTIC_CHUNK_MAX_CHARS,
+    SEMANTIC_CHUNK_MIN_CHARS,
     SYSTEM_PROMPT,
     TOP_K_BM25,
     TOP_K_CONTEXT,
@@ -33,9 +47,14 @@ from config import (
 )
 
 try:
-    from docx import Document as DocxDocument  # type: ignore[import-not-found]
+    from langchain_community.document_loaders import Docx2txtLoader  # type: ignore[import-not-found]
 except ImportError:  # pragma: no cover - optional dependency
-    DocxDocument = None
+    Docx2txtLoader = None
+
+try:
+    from langchain_text_splitters import RecursiveCharacterTextSplitter  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover - optional dependency
+    RecursiveCharacterTextSplitter = None
 
 try:
     from pypdf import PdfReader  # type: ignore[import-not-found]
@@ -47,8 +66,9 @@ SENTENCE_SPLIT_RE = re.compile(r"(?<=[。！？!?；;\.])\s*")
 WORD_RE = re.compile(r"[\w\u4e00-\u9fff]+")
 STOPWORDS = {"的", "了", "和", "是", "在", "请问", "什么", "如何", "怎么", "为什么", "吗", "呢", "吧"}
 TERM_TITLE_RE = re.compile(r"^(?:\d+[\.)、]|[（(]?\d+[）)]?\s*)?(.{2,40}?)(?:[:：\-—]\s*(.*))?$")
-DOCX_CHUNK_MAX_CHARS = 180
-DOCX_CHUNK_OVERLAP = 30
+DOCX_CHUNK_MAX_CHARS = 700
+DOCX_CHUNK_OVERLAP = 100
+DOCX_RECURSIVE_SEPARATORS = ["\n\n", "\n", "。", "！", "？", "；", "，", "、", " ", ""]
 TERM_MERGE_MIN_CHARS = 40
 
 
@@ -172,25 +192,27 @@ def read_text_file(file_path: Path) -> str:
         return file_path.read_text(encoding="utf-8", errors="ignore")
 
 
-def keep_chinese_text(text: str) -> str:
-    lines = []
-    for raw_line in normalize_text(text).split("\n"):
-        line = raw_line.strip()
-        if not line:
-            continue
-        chinese_only = "".join(re.findall(r"[\u4e00-\u9fff\s，。！？；：、（）《》“”‘’—…·]+", line))
-        chinese_only = re.sub(r"\s+", " ", chinese_only).strip()
-        if chinese_only:
-            lines.append(chinese_only)
-    return "\n".join(lines)
-
-
 def read_docx_file(file_path: Path) -> str:
-    if DocxDocument is None:
-        raise ImportError("缺少 python-docx 依赖，无法解析 Word 文档。")
-    doc = DocxDocument(str(file_path))
-    paragraphs = [p.text.strip() for p in doc.paragraphs if p.text and p.text.strip()]
-    return keep_chinese_text("\n".join(paragraphs))
+    if Docx2txtLoader is None:
+        raise ImportError("缺少 langchain_community 依赖，无法解析 Word 文档。")
+    loader = Docx2txtLoader(str(file_path))
+    documents = loader.load()
+    text = "\n".join(doc.page_content for doc in documents if getattr(doc, "page_content", "").strip())
+    return normalize_text(text)
+
+
+def recursive_split_text(text: str, chunk_size: int = DOCX_CHUNK_MAX_CHARS, chunk_overlap: int = DOCX_CHUNK_OVERLAP) -> List[str]:
+    text = normalize_text(text)
+    if not text:
+        return []
+    if RecursiveCharacterTextSplitter is not None:
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            separators=DOCX_RECURSIVE_SEPARATORS,
+        )
+        return splitter.split_text(text)
+    return further_chunk_long_text(text, max_chars=chunk_size, overlap=chunk_overlap)
 
 
 def chunk_title_from_text(text: str, fallback: str, index: int) -> str:
@@ -204,51 +226,113 @@ def chunk_title_from_text(text: str, fallback: str, index: int) -> str:
     return first_line or f"{fallback}-{index}"
 
 
-def split_docx_forced_chunks(text: str, source_file: str) -> List[DocumentChunk]:
-    lines = [line.strip() for line in normalize_text(text).split("\n") if line.strip()]
-    if not lines:
+def split_sentences(text: str) -> List[str]:
+    text = normalize_text(text)
+    if not text:
+        return []
+    sentences = [sentence.strip() for sentence in SENTENCE_SPLIT_RE.split(text) if sentence and sentence.strip()]
+    return sentences
+
+
+def cosine_distance(vec_a: Sequence[float], vec_b: Sequence[float]) -> float:
+    a = np.asarray(vec_a, dtype=np.float32)
+    b = np.asarray(vec_b, dtype=np.float32)
+    denom = float(np.linalg.norm(a) * np.linalg.norm(b))
+    if denom == 0:
+        return 0.0
+    similarity = float(np.dot(a, b) / denom)
+    similarity = max(min(similarity, 1.0), -1.0)
+    return 1.0 - similarity
+
+
+def semantic_split_text(
+    text: str,
+    embedder: "EmbeddingClient",
+    max_chars: int = SEMANTIC_CHUNK_MAX_CHARS,
+    min_chars: int = SEMANTIC_CHUNK_MIN_CHARS,
+    buffer_size: int = SEMANTIC_CHUNK_BUFFER_SIZE,
+    breakpoint_percentile_threshold: float = SEMANTIC_CHUNK_BREAKPOINT_PERCENTILE,
+) -> List[str]:
+    text = normalize_text(text)
+    if not text:
         return []
 
-    paragraphs: list[str] = []
-    buffer: list[str] = []
-    for line in lines:
-        if TITLE_RE.match(line):
-            if buffer:
-                paragraphs.append(normalize_text("\n".join(buffer)))
-                buffer = []
-            paragraphs.append(line)
-        else:
-            buffer.append(line)
-    if buffer:
-        paragraphs.append(normalize_text("\n".join(buffer)))
+    sentences = split_sentences(text)
+    if len(sentences) <= 1:
+        return [text]
+    if len(sentences) <= buffer_size:
+        return [text]
 
-    if not paragraphs:
-        paragraphs = [normalize_text(text)]
+    window_texts: List[str] = []
+    half_window = max(1, buffer_size // 2)
+    for idx in range(len(sentences)):
+        start = max(0, idx - half_window)
+        end = min(len(sentences), idx + half_window + 1)
+        window_texts.append(" ".join(sentences[start:end]))
+
+    embeddings = embedder.embed(window_texts)
+    if len(embeddings) < 2:
+        return [text]
+
+    distances = [cosine_distance(embeddings[i], embeddings[i + 1]) for i in range(len(embeddings) - 1)]
+    threshold = float(np.percentile(distances, breakpoint_percentile_threshold)) if distances else 1.0
+
+    chunks: List[str] = []
+    current: List[str] = []
+    for idx, sentence in enumerate(sentences):
+        current.append(sentence)
+        current_text = normalize_text(" ".join(current))
+        should_break = idx < len(distances) and distances[idx] >= threshold and len(current_text) >= min_chars
+        if should_break:
+            chunks.append(current_text)
+            current = []
+    if current:
+        chunks.append(normalize_text(" ".join(current)))
+
+    final_chunks: List[str] = []
+    for chunk in chunks:
+        chunk = normalize_text(chunk)
+        if not chunk:
+            continue
+        if len(chunk) > max_chars:
+            final_chunks.extend(recursive_split_text(chunk, chunk_size=max_chars, chunk_overlap=DOCX_CHUNK_OVERLAP))
+            continue
+        if final_chunks and len(chunk) < min_chars:
+            merged = normalize_text(f"{final_chunks[-1]}\n{chunk}")
+            if len(merged) <= max_chars:
+                final_chunks[-1] = merged
+                continue
+        final_chunks.append(chunk)
+
+    return [chunk for chunk in final_chunks if chunk.strip()]
+
+
+def semantic_split_docx_chunks(file_path: Path, embedder: "EmbeddingClient") -> List[DocumentChunk]:
+    text = read_docx_file(file_path)
+    pieces = recursive_split_text(text, chunk_size=max(DOCX_CHUNK_MAX_CHARS, SEMANTIC_CHUNK_MAX_CHARS), chunk_overlap=DOCX_CHUNK_OVERLAP)
+    semantic_pieces: List[str] = []
+    if DOCX_ENABLE_SEMANTIC_CHUNKING:
+        for piece in pieces:
+            semantic_pieces.extend(semantic_split_text(piece, embedder=embedder))
+    else:
+        semantic_pieces = pieces
 
     chunks: list[DocumentChunk] = []
-    order = 0
-    current_title = Path(source_file).stem
-
-    for block in paragraphs:
-        if TITLE_RE.match(block):
-            current_title = TITLE_RE.match(block).group(2).strip()
+    for order, piece in enumerate(semantic_pieces, start=1):
+        piece = normalize_text(piece)
+        if not piece:
             continue
-        for piece in further_chunk_long_text(block, max_chars=DOCX_CHUNK_MAX_CHARS, overlap=DOCX_CHUNK_OVERLAP):
-            piece = normalize_text(piece)
-            if not piece:
-                continue
-            order += 1
-            title = chunk_title_from_text(piece, current_title, order)
-            chunks.append(
-                DocumentChunk(
-                    chunk_id=make_chunk_id(source_file, order, 0, f"{title}\n{piece}"),
-                    source_file=source_file,
-                    title_path=title,
-                    content=piece,
-                    heading_level=1,
-                    order=order,
-                )
+        title = chunk_title_from_text(piece, file_path.stem, order)
+        chunks.append(
+            DocumentChunk(
+                chunk_id=make_chunk_id(str(file_path), order, 0, f"{title}\n{piece}"),
+                source_file=str(file_path),
+                title_path=title,
+                content=piece,
+                heading_level=1,
+                order=order,
             )
+        )
     return chunks
 
 
@@ -276,19 +360,22 @@ def load_file_content(file_path: Path) -> str:
     return ""
 
 
-def load_documents(doc_dir: Path) -> List[DocumentChunk]:
+def load_documents(doc_dir: Path, embedder: "EmbeddingClient | None" = None) -> List[DocumentChunk]:
     documents: List[DocumentChunk] = []
     supported_suffixes = {".md", ".markdown", ".txt", ".docx", ".pdf"}
+    embedder = embedder or EmbeddingClient()
     for file_path in sorted(doc_dir.rglob("*")):
         if not file_path.is_file() or file_path.suffix.lower() not in supported_suffixes:
             continue
+        if file_path.suffix.lower() == ".docx":
+            base_chunks = semantic_split_docx_chunks(file_path, embedder=embedder)
+            documents.extend(base_chunks)
+            continue
+
         text = load_file_content(file_path)
         if not text.strip():
             continue
-        if file_path.suffix.lower() == ".docx":
-            base_chunks = split_docx_forced_chunks(text, str(file_path))
-        else:
-            base_chunks = split_by_title(text, str(file_path))
+        base_chunks = split_by_title(text, str(file_path))
         if not base_chunks:
             base_chunks = [
                 DocumentChunk(
@@ -320,41 +407,120 @@ def load_documents(doc_dir: Path) -> List[DocumentChunk]:
 
 
 class EmbeddingClient:
-    """轻量兼容的本地/HTTP embedding 客户端。
+    """使用 DashScope SDK 的 embedding 客户端。
 
-    优先尝试调用环境变量 EMBEDDING_API_URL 指定的服务；
-    若未配置，则使用纯词袋向量作为兜底，保证项目可运行。
+    优先调用 qwen3.7-text-embedding；如果未安装 dashscope 或未配置 API Key，则回退到本地词袋向量。
     """
 
+    MAX_BATCH_SIZE = 20
+
     def __init__(self) -> None:
-        self.api_url = os.getenv( "").strip()
-        self.api_key = os.getenv( "").strip()
-        self.dimension = int(os.getenv("EMBEDDING_DIM", "384"))
+        self.model = EMBEDDING_MODEL
+        self.api_key = EMBEDDING_API_KEY or QWEN_API_KEY
+        self.dimension = int(os.getenv("EMBEDDING_DIM", "1024"))
+        self._sdk_available = dashscope is not None and bool(self.api_key)
+        if self._sdk_available:
+            dashscope.api_key = self.api_key
 
     def embed(self, texts: Sequence[str]) -> List[List[float]]:
-        if self.api_url:
-            return self._embed_via_http(texts)
-        return [self._fallback_embed(text) for text in texts]
+        if self._sdk_available:
+            return self._embed_via_dashscope(texts)
+        return self._fallback_embed(texts)
 
-    def _embed_via_http(self, texts: Sequence[str]) -> List[List[float]]:
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-        payload = {"texts": list(texts)}
-        resp = requests.post(self.api_url, json=payload, headers=headers, timeout=60)
-        resp.raise_for_status()
-        data = resp.json()
-        return data["embeddings"]
+    def _embed_via_dashscope(self, texts: Sequence[str]) -> List[List[float]]:
+        if not texts:
+            return []
 
-    def _fallback_embed(self, text: str) -> List[float]:
-        vec = np.zeros(self.dimension, dtype=np.float32)
-        for token in tokenize(text):
-            idx = stable_hash_token(token) % self.dimension
-            vec[idx] += 1.0
-        norm = np.linalg.norm(vec)
-        if norm > 0:
-            vec /= norm
-        return vec.tolist()
+        all_embeddings: List[List[float]] = []
+        for start in range(0, len(texts), self.MAX_BATCH_SIZE):
+            batch = list(texts[start:start + self.MAX_BATCH_SIZE])
+            batch_embeddings = self._call_dashscope_batch(batch)
+            if len(batch_embeddings) != len(batch):
+                raise ValueError(
+                    f"DashScope embedding 返回数量不匹配，输入 {len(batch)} 条，返回 {len(batch_embeddings)} 条"
+                )
+            all_embeddings.extend(batch_embeddings)
+        return all_embeddings
+
+    def _call_dashscope_batch(self, texts: Sequence[str]) -> List[List[float]]:
+        if len(texts) == 1:
+            input_payload: str | List[str] = texts[0]
+        else:
+            input_payload = list(texts)
+
+        resp = dashscope.TextEmbedding.call(  # type: ignore[union-attr]
+            model=self.model,
+            input=input_payload,
+        )
+        if getattr(resp, "status_code", None) not in (None, 200, HTTPStatus.OK):
+            raise RuntimeError(f"DashScope embedding 请求失败: {resp}")
+
+        output = getattr(resp, "output", None)
+        embeddings = self._extract_embeddings(output)
+        if not embeddings:
+            raise ValueError(f"DashScope embedding 返回结果为空: {resp}")
+        return embeddings
+
+    def _extract_embeddings(self, output: object) -> List[List[float]]:
+        if not isinstance(output, dict):
+            return []
+
+        for key in ("embeddings", "data", "output"):
+            embeddings = self._normalize_embedding_container(output.get(key))
+            if embeddings:
+                return embeddings
+        return []
+
+    def _normalize_embedding_container(self, candidate: object) -> List[List[float]]:
+        if candidate is None:
+            return []
+
+        if isinstance(candidate, dict):
+            candidate = [candidate]
+
+        if isinstance(candidate, list):
+            normalized: List[List[float]] = []
+            for item in candidate:
+                vector = self._normalize_embedding_item(item)
+                if vector is None:
+                    continue
+                normalized.append(vector)
+            return normalized
+
+        vector = self._normalize_embedding_item(candidate)
+        return [vector] if vector is not None else []
+
+    def _normalize_embedding_item(self, item: object) -> List[float] | None:
+        if isinstance(item, dict):
+            for key in ("embedding", "vector", "embeddings"):
+                value = item.get(key)
+                if isinstance(value, list):
+                    try:
+                        return [float(x) for x in value]
+                    except (TypeError, ValueError):
+                        return None
+            return None
+
+        if isinstance(item, (list, tuple)):
+            try:
+                return [float(x) for x in item]
+            except (TypeError, ValueError):
+                return None
+
+        return None
+
+    def _fallback_embed(self, texts: Sequence[str]) -> List[List[float]]:
+        vectors: List[List[float]] = []
+        for text in texts:
+            vec = np.zeros(self.dimension, dtype=np.float32)
+            for token in tokenize(text):
+                idx = stable_hash_token(token) % self.dimension
+                vec[idx] += 1.0
+            norm = np.linalg.norm(vec)
+            if norm > 0:
+                vec /= norm
+            vectors.append(vec.tolist())
+        return vectors
 
 
 class RAGIndex:
@@ -415,7 +581,7 @@ class RAGIndex:
 
     def build(self, doc_dir: Path | None = None) -> int:
         doc_dir = doc_dir or self.paths.doc_dir
-        docs = load_documents(doc_dir)
+        docs = load_documents(doc_dir, embedder=self.embedder)
         self.chunks = docs
         self._build_bm25()
         self._reset_collection()
