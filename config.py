@@ -17,7 +17,14 @@ CACHE_DIR = DATA_DIR / "cache"
 KB_DIR = BASE_DIR / "知识库"
 DEFAULT_DOC_DIR = Path(os.getenv("DOC_DIR", str(KB_DIR if KB_DIR.exists() else BASE_DIR / "知识库")))
 
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "bge-m3")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "qwen3.7-text-embedding")
+EMBEDDING_API_URL = os.getenv("EMBEDDING_API_URL", "").strip().strip('"').strip("'")
+EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY", "").strip()
+DOCX_ENABLE_SEMANTIC_CHUNKING = os.getenv("DOCX_ENABLE_SEMANTIC_CHUNKING", "true").lower() == "true"
+SEMANTIC_CHUNK_MIN_CHARS = int(os.getenv("SEMANTIC_CHUNK_MIN_CHARS", "180"))
+SEMANTIC_CHUNK_MAX_CHARS = int(os.getenv("SEMANTIC_CHUNK_MAX_CHARS", "900"))
+SEMANTIC_CHUNK_BUFFER_SIZE = int(os.getenv("SEMANTIC_CHUNK_BUFFER_SIZE", "3"))
+SEMANTIC_CHUNK_BREAKPOINT_PERCENTILE = float(os.getenv("SEMANTIC_CHUNK_BREAKPOINT_PERCENTILE", "90"))
 CHUNK_MAX_CHARS = int(os.getenv("CHUNK_MAX_CHARS", "1200"))
 CHUNK_OVERLAP_CHARS = int(os.getenv("CHUNK_OVERLAP_CHARS", "120"))
 TOP_K_BM25 = int(os.getenv("TOP_K_BM25", "8"))
@@ -56,3 +63,53 @@ class AppPaths:
 def ensure_dirs() -> None:
     for path in (DATA_DIR, RAW_DIR, CHROMA_DIR, CACHE_DIR):
         path.mkdir(parents=True, exist_ok=True)
+
+
+# config.py 末尾添加
+
+# ========== 兼容旧代码的 get_config 函数 ==========
+def get_config(key: str = None, default=None):
+    """
+    获取配置值（兼容旧接口）
+
+    Args:
+        key: 配置键，支持点号分隔的路径，如 "llm.model_name"
+        default: 默认值
+
+    Returns:
+        配置值
+    """
+    # 如果 key 为 None，返回整个配置字典
+    if key is None:
+        return {
+            "db_path": str(DATA_DIR / "agent.db"),
+            "llm": {
+                "model_name": QWEN_MODEL,
+                "api_key": QWEN_API_KEY,
+                "api_base": QWEN_BASE_URL,
+            },
+            "prompt": {
+                "instructions": []
+            }
+        }
+
+    # 支持点号分隔的路径，如 "llm.model_name"
+    parts = key.split(".")
+    current = {
+        "db_path": str(DATA_DIR / "agent.db"),
+        "llm": {
+            "model_name": QWEN_MODEL,
+            "api_key": QWEN_API_KEY,
+            "api_base": QWEN_BASE_URL,
+        },
+        "prompt": {
+            "instructions": []
+        }
+    }
+
+    try:
+        for part in parts:
+            current = current[part]
+        return current
+    except (KeyError, TypeError):
+        return default
